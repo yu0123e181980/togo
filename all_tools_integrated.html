@@ -6494,10 +6494,7 @@
             })();
         }
 
-        function initVisualBenchmarkTool() {
-            // ビジュアルベンチマークツールの初期化
-            console.log('ビジュアルベンチマークツール初期化');
-        }
+        // initVisualBenchmarkTool is defined in the Visual Benchmarking Tool IIFE
 
         function initABCAnalysisTool() {
             // IIFE内でスコープ分離
@@ -7449,56 +7446,64 @@
     (function() {
         'use strict';
 
+        // Tool-scoped variables
+        let rawData = [];
+        let filteredData = [];
+        let currentHierarchy = [];
+        let currentMode = 'hierarchy';
+        let currentMetric = 'sku';
+        let comparisonChart = null;
+        let arbitraryChart = null;
+        let priceChart = null;
+        let currentPage = 1;
+        const itemsPerPage = 50;
+        let storeOrder = [];
+        let sortState = {column: null, direction: null};
+        let hiddenDatasets = new Set();
+        let priceHierarchy = [];
+        let priceInterval = 50;
+
+        const hierarchyLevels = ['カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント', 'JAN'];
+
+        function setupAspectRatioControls() {
+            // Aspect ratio controls setup (if needed)
+            // This function can be used to setup custom aspect ratio controls
+        }
+
         function initializeApp() {
             setupAspectRatioControls();
-            
-            let rawData = [];
-            let filteredData = [];
-            let currentHierarchy = [];
-            let currentMode = 'hierarchy';
-            let currentMetric = 'sku';
-            let comparisonChart = null;
-            let arbitraryChart = null;
-            let priceChart = null;
-            let currentPage = 1;
-            const itemsPerPage = 50;
-            let storeOrder = [];
-            let sortState = {column: null, direction: null};
-            let hiddenDatasets = new Set();
-            let priceHierarchy = [];
-            let priceInterval = 50;
-            
-            const hierarchyLevels = ['カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント', 'JAN'];
-            
+
             // Use integrated file loading
-        const uploadArea = document.getElementById('visualBenchmark-uploadArea');
-        uploadArea.addEventListener('click', () => {
-            readExcelFile('visualBenchmark').then(data => {
-                if (data && data.length > 0) {
-                    handleData(data);
-                }
-            }).catch(error => {
-                console.error('Error loading Visual Benchmark file:', error);
-                alert('Visual Benchmark ファイルの読み込みに失敗しました');
-            });
-        });
+            const uploadArea = document.getElementById('visualBenchmark-uploadArea');
+            uploadArea.addEventListener('click', () => {
+                showLoading('visualBenchmark-uploadArea');
+
+                readExcelFile('visualBenchmark').then(workbook => {
+                    try {
                         const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
                         const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-                        
-                        rawData = jsonData.filter(row => 
-                            row['企業名'] !== '設定なし' && 
+
+                        rawData = jsonData.filter(row =>
+                            row['企業名'] !== '設定なし' &&
                             row['店舗名'] !== '設定なし' &&
                             row['カテゴリー'] !== '設定なし' &&
                             row['棚名称'] !== '設定なし'
                         );
-                        
+
+                        if (rawData.length === 0) {
+                            throw new Error('有効なデータが見つかりませんでした');
+                        }
+
                         initializeData();
                     } catch (error) {
-                        alert('ファイルの読み込みに失敗しました: ' + error.message);
+                        console.error('Error processing Visual Benchmark data:', error);
+                        showError('ファイルの読み込みに失敗しました: ' + error.message, 'visualBenchmark-uploadArea');
                     }
-                };
-                reader.readAsArrayBuffer(file);
-            }
+                }).catch(error => {
+                    console.error('Error loading Visual Benchmark file:', error);
+                    showError('Visual Benchmark ファイルの読み込みに失敗しました: ' + error.message, 'visualBenchmark-uploadArea');
+                });
+            });
             
             function initializeData() {
                 document.getElementById('visualBenchmark-mainContent').classList.remove('hidden');
@@ -7512,32 +7517,32 @@
                 const categories = [...new Set(rawData.map(d => d['カテゴリー']))].sort();
                 const companies = [...new Set(rawData.map(d => d['企業名']))].sort();
                 const shelves = [...new Set(rawData.map(d => d['棚名称']))].sort();
-                
-                populateSelect('filterCategory', categories);
-                populateSelect('filterCompany', companies);
-                populateSelect('filterShelf', shelves);
-                
+
+                populateSelect('visualBenchmark-filterCategory', categories);
+                populateSelect('visualBenchmark-filterCompany', companies);
+                populateSelect('visualBenchmark-filterShelf', shelves);
+
                 populateStoreFilters();
             }
-            
+
             function populateStoreFilters() {
                 const companies = [...new Set(rawData.map(d => d['企業名']))].sort();
                 const storeFiltersContainer = document.getElementById('visualBenchmark-storeFilters');
-                
+
                 storeFiltersContainer.innerHTML = '';
-                
+
                 companies.forEach(company => {
                     const stores = [...new Set(rawData.filter(d => d['企業名'] === company).map(d => d['店舗名']))].sort();
-                    
+
                     const groupDiv = document.createElement('div');
                     groupDiv.className = 'visualBenchmark-store-group';
-                    
+
                     const titleDiv = document.createElement('div');
                     titleDiv.className = 'visualBenchmark-store-group-title';
                     titleDiv.textContent = company;
-                    
+
                     const select = document.createElement('select');
-                    select.id = `filterStore_${company}`;
+                    select.id = `visualBenchmark-filterStore_${company}`;
                     select.multiple = true;
                     select.size = Math.min(stores.length, 5);
                     
@@ -7579,13 +7584,13 @@
             }
             
             function applyFilters() {
-                const selectedCategories = getSelectedValues('filterCategory');
-                const selectedCompanies = getSelectedValues('filterCompany');
-                const selectedShelves = getSelectedValues('filterShelf');
-                
+                const selectedCategories = getSelectedValues('visualBenchmark-filterCategory');
+                const selectedCompanies = getSelectedValues('visualBenchmark-filterCompany');
+                const selectedShelves = getSelectedValues('visualBenchmark-filterShelf');
+
                 const selectedStores = [];
                 selectedCompanies.forEach(company => {
-                    const storeSelect = document.getElementById(`filterStore_${company}`);
+                    const storeSelect = document.getElementById(`visualBenchmark-filterStore_${company}`);
                     if (storeSelect) {
                         selectedStores.push(...Array.from(storeSelect.selectedOptions).map(opt => opt.value));
                     }
@@ -9303,18 +9308,24 @@
         }
     
 
-        // Auto-initialize when tab is activated
-        window.initVisualBenchmark = function() {
+        // Export initialization function
+        window.initVisualBenchmarkTool = function() {
             // Check if already initialized
-            if (document.getElementById('visualBenchmark-mainContent').classList.contains('initialized')) {
+            const mainContent = document.getElementById('visualBenchmark-mainContent');
+            if (!mainContent) {
+                console.error('visualBenchmark-mainContent element not found');
+                return;
+            }
+
+            if (mainContent.classList.contains('initialized')) {
                 return;
             }
 
             // Mark as initialized
-            document.getElementById('visualBenchmark-mainContent').classList.add('initialized');
+            mainContent.classList.add('initialized');
 
             // Initialize the tool
-            // initializeApp will be called when data is loaded
+            initializeApp();
         };
     })();
 
