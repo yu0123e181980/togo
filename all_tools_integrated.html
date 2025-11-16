@@ -4067,16 +4067,318 @@
         // これらは後で各ツールの実装に置き換えられます
 
         // ===== 棚割データ処理ツール =====
-        function initShelfDataTool() {
-            // IIFE内でスコープ分離
-            (function() {
-                // ツール専用のグローバル変数
-                let shelfData_currentWorkbook = null;
-                let shelfData_parsedData = null;
+        (function() {
+            'use strict';
+
+            // ツール専用の変数
+            let shelfData_currentWorkbook = null;
+            let shelfData_parsedData = null;
+            let shelfData_initialized = false;
+
+            // ステータス表示
+            function shelfData_showStatus(type, message) {
+                const status = document.getElementById('shelfData-status');
+                status.className = `status ${type}`;
+                status.innerHTML = message;
+                status.style.display = 'block';
+            }
+
+            function shelfData_showStatusWithSpinner(type, message) {
+                const status = document.getElementById('shelfData-status');
+                status.className = `status ${type}`;
+                status.innerHTML = `<div class="loading-spinner"></div><span>${message}</span>`;
+                status.style.display = 'flex';
+            }
+
+            function shelfData_updateStepIndicator(step) {
+                document.querySelectorAll('#tabContent1 .step').forEach((el, idx) => {
+                    if (idx < step) {
+                        el.classList.add('active');
+                    } else {
+                        el.classList.remove('active');
+                    }
+                });
+            }
+
+            function shelfData_updateProgress(percent) {
+                const progressBar = document.getElementById('shelfData-progressBar');
+                progressBar.style.width = `${percent}%`;
+            }
+
+            function shelfData_calculateShelfHeights(maxStep) {
+                const baseHeight = 150;
+                const totalHeight = 2400;
+                const availableHeight = totalHeight - baseHeight;
+
+                if (maxStep < 2 || maxStep > 9) {
+                    return [];
+                }
+
+                const interval = Math.floor(availableHeight / (maxStep - 1));
+                const heights = [];
+                for (let i = 0; i < maxStep; i++) {
+                    heights.push(baseHeight + i * interval);
+                }
+                return heights;
+            }
+
+            function shelfData_sanitizeFilename(filename) {
+                return filename.replace(/[\\/:*?"<>|]/g, '');
+            }
+
+            // ファイル削除関数
+            window.shelfData_removeFile = function() {
+                shelfData_currentWorkbook = null;
+                shelfData_parsedData = null;
+                document.getElementById('shelfData-fileInfoContainer').style.display = 'none';
+                document.getElementById('shelfData-folderSelection').style.display = 'none';
+                document.getElementById('shelfData-processBtn').disabled = true;
+                document.getElementById('shelfData-uploadArea').style.display = 'block';
+                document.getElementById('shelfData-status').style.display = 'none';
+                document.getElementById('shelfData-progressContainer').style.display = 'none';
+                shelfData_updateStepIndicator(1);
+            };
+
+            // データ処理メイン関数
+            async function shelfData_processData(data, folderType) {
+                // ヘッダー行を取得
+                const headers = data[0].map(h => String(h).trim());
+                const rows = data.slice(1);
+
+                // DataFrameのような構造に変換
+                const df = rows.map(row => {
+                    const obj = {};
+                    headers.forEach((header, i) => {
+                        obj[header] = row[i];
+                    });
+                    return obj;
+                }).filter(row => row['棚名称'] !== '設定なし' && row['棚名称']);
+
+                if (df.length === 0) {
+                    throw new Error('有効なデータが見つかりません。');
+                }
+
+                // 店舗CD × 棚名称のユニークな組み合わせを取得
+                const combinations = new Map();
+                df.forEach(row => {
+                    const key = `${row['店舗CD']}_${row['棚名称']}`;
+                    if (!combinations.has(key)) {
+                        combinations.set(key, {
+                            店舗CD: row['店舗CD'],
+                            棚名称: row['棚名称']
+                        });
+                    }
+                });
+
+                const zip = new JSZip();
+                let processedCount = 0;
+                const totalCount = combinations.size;
+
+                for (const [key, combo] of combinations) {
+                    // 進捗表示を更新
+                    shelfData_showStatusWithSpinner('processing', `処理中... (${processedCount + 1}/${totalCount}件)`);
+
+                    // 該当データを抽出
+                    let shelfData = df.filter(row =>
+                        row['店舗CD'] === combo.店舗CD && row['棚名称'] === combo.棚名称
+                    );
+
+                    // 棚番号でソート
+                    shelfData.sort((a, b) => {
+                        const numA = parseInt(a['棚番号']) || 0;
+                        const numB = parseInt(b['棚番号']) || 0;
+                        return numA - numB;
+                    });
+
+                    // 台番号の割り当て
+                    const shelfNumbers = [...new Set(shelfData.map(r => r['棚番号']))];
+                    const shelfToUnit = {};
+                    shelfNumbers.forEach((num, idx) => {
+                        shelfToUnit[num] = idx + 1;
+                    });
+
+                    shelfData.forEach(row => {
+                        row['台'] = shelfToUnit[row['棚番号']];
+                        row['列'] = Math.floor(parseInt(row['列']) / 10);
+                    });
+
+                    // 段の反転処理
+                    const unitGroups = {};
+                    shelfData.forEach(row => {
+                        const unit = row['台'];
+                        if (!unitGroups[unit]) unitGroups[unit] = [];
+                        unitGroups[unit].push(row);
+                    });
+
+                    Object.values(unitGroups).forEach(group => {
+                        const steps = group.map(r => parseInt(r['段']));
+                        const minStep = Math.min(...steps);
+                        const maxStep = Math.max(...steps);
+
+                        group.forEach(row => {
+                            const currentStep = parseInt(row['段']);
+                            row['段'] = maxStep - (currentStep - minStep);
+                        });
+                    });
+
+                    // メタ情報の取得
+                    const storeName = shelfData[0]['店舗'];
+                    const shelfName = shelfData[0]['棚名称'];
+                    const patternName = shelfData[0]['棚パターン名'];
+
+                    // フォルダ名とファイル名の決定
+                    let folderName, fileName;
+                    if (folderType === 'store') {
+                        folderName = shelfData_sanitizeFilename(`${combo.店舗CD}-${storeName}`);
+                        fileName = shelfData_sanitizeFilename(`${storeName}_${shelfName}_${patternName}.csv`);
+                    } else {
+                        folderName = shelfData_sanitizeFilename(shelfName);
+                        fileName = shelfData_sanitizeFilename(`${shelfName}_${patternName}.csv`);
+                    }
+
+                    // 台幅の判定
+                    const shelfWidth = ['3尺', 'ｻｲﾄﾞﾈｯﾄ', 'ｼｰｽﾞﾆﾝｸﾞ'].some(x => patternName.includes(x)) ? 900 : 1200;
+
+                    // CSV出力データの構築
+                    const outputData = [];
+                    outputData.push(['共通棚割情報', 'V3.0', 'IC']);
+                    outputData.push([fileName]);
+                    outputData.push(['台番号', '台高さ', '台幅', '台奥行', '台名称']);
+
+                    const uniqueUnits = [...new Set(shelfData.map(r => r['台']))].sort((a, b) => a - b);
+                    uniqueUnits.forEach(unit => {
+                        outputData.push([unit, 2400, shelfWidth, 400, '']);
+                    });
+
+                    outputData.push(['台番号', '棚段番号', '棚高さ', '棚幅', '棚奥行', '棚厚さ', '棚種別']);
+
+                    uniqueUnits.forEach(unit => {
+                        const unitData = shelfData.filter(r => r['台'] === unit);
+                        const maxStep = Math.max(...unitData.map(r => parseInt(r['段'])));
+                        const shelfHeights = shelfData_calculateShelfHeights(maxStep);
+
+                        const uniqueSteps = [...new Set(unitData.map(r => parseInt(r['段'])))].sort((a, b) => a - b);
+                        uniqueSteps.forEach((step, idx) => {
+                            outputData.push([unit, step, shelfHeights[idx], shelfWidth, 400, 10, 1]);
+                        });
+                    });
+
+                    outputData.push(['台番号', '棚段番号', '棚位置', '商品コード', 'フェース数', 'フェース面', 'フェース回転', '積上陳列数', '在庫数量', 'フェース内陳列区分', 'フェース内位置', '奥行陳列数']);
+
+                    shelfData.sort((a, b) => {
+                        if (a['台'] !== b['台']) return a['台'] - b['台'];
+                        return parseInt(a['段']) - parseInt(b['段']);
+                    });
+
+                    shelfData.forEach(row => {
+                        outputData.push([
+                            row['台'],
+                            row['段'],
+                            row['列'],
+                            row['JAN'],
+                            row['フェイス数'],
+                            1, 0, 1, 0, 0, 1, 1
+                        ]);
+                    });
+
+                    // CSVに変換
+                    const csvContent = outputData.map(row => row.join(',')).join('\r\n');
+
+                    // Shift_JISにエンコード
+                    const unicodeArray = [];
+                    for (let i = 0; i < csvContent.length; i++) {
+                        unicodeArray.push(csvContent.charCodeAt(i));
+                    }
+                    const sjisArray = Encoding.convert(unicodeArray, {
+                        to: 'SJIS',
+                        from: 'UNICODE'
+                    });
+                    const uint8Array = new Uint8Array(sjisArray);
+
+                    // ZIPに追加
+                    zip.folder(folderName).file(fileName, uint8Array);
+
+                    processedCount++;
+                    shelfData_updateProgress((processedCount / totalCount) * 100);
+                }
+
+                // 出力ファイル一覧を作成
+                shelfData_showStatusWithSpinner('processing', '出力ファイル一覧を作成中...');
+                const fileList = [];
+                zip.forEach((relativePath, file) => {
+                    if (!file.dir) {
+                        fileList.push([relativePath]);
+                    }
+                });
+
+                const listCsv = 'ファイルパス\r\n' + fileList.map(row => row.join(',')).join('\r\n');
+
+                // 一覧CSVもShift_JISにエンコード
+                const listUnicodeArray = [];
+                for (let i = 0; i < listCsv.length; i++) {
+                    listUnicodeArray.push(listCsv.charCodeAt(i));
+                }
+                const listSjisArray = Encoding.convert(listUnicodeArray, {
+                    to: 'SJIS',
+                    from: 'UNICODE'
+                });
+                const listUint8Array = new Uint8Array(listSjisArray);
+
+                zip.file('出力ファイル一覧.csv', listUint8Array);
+
+                // ZIPをダウンロード
+                shelfData_showStatusWithSpinner('processing', 'ZIPファイルを生成中...');
+                const content = await zip.generateAsync({
+                    type: 'blob',
+                    compression: "DEFLATE",
+                    compressionOptions: {
+                        level: 9
+                    }
+                });
+                shelfData_showStatus('success', 'ZIPファイルをダウンロード中...');
+                saveAs(content, `棚割データ_${folderType === 'store' ? '店舗別' : '棚名称別'}_${new Date().toISOString().slice(0, 10)}.zip`);
+
+                return totalCount;
+            }
+
+            // データ処理関数
+            window.shelfData_processFile = async function() {
+                if (!shelfData_parsedData) return;
+
+                const processBtn = document.getElementById('shelfData-processBtn');
+                const progressContainer = document.getElementById('shelfData-progressContainer');
+                const progressBar = document.getElementById('shelfData-progressBar');
+
+                shelfData_updateStepIndicator(3);
+                processBtn.disabled = true;
+                progressContainer.style.display = 'block';
+                progressBar.style.width = '0%';
+
+                try {
+                    shelfData_showStatusWithSpinner('processing', 'データを処理中...');
+
+                    const folderType = document.querySelector('input[name="shelfData-folderType"]:checked').value;
+                    const count = await shelfData_processData(shelfData_parsedData, folderType);
+
+                    shelfData_showStatus('success', `処理完了！ ${count}件のファイルを出力しました。`);
+                    progressBar.style.width = '100%';
+                } catch (error) {
+                    shelfData_showStatus('error', `処理エラー: ${error.message}`);
+                    console.error(error);
+                } finally {
+                    processBtn.disabled = false;
+                }
+            };
+
+            // 初期化関数を公開
+            window.initShelfDataTool = function() {
+                if (shelfData_initialized) {
+                    return;
+                }
+                shelfData_initialized = true;
 
                 // DOM要素の取得
                 const uploadArea = document.getElementById('shelfData-uploadArea');
-                const processBtn = document.getElementById('shelfData-processBtn');
 
                 // アップロードエリアのクリック処理
                 uploadArea.addEventListener('click', async () => {
@@ -4125,330 +4427,29 @@
                     });
                 });
 
-                // ファイル削除関数をグローバルスコープに公開
-                window.shelfData_removeFile = function() {
-                    shelfData_currentWorkbook = null;
-                    shelfData_parsedData = null;
-                    document.getElementById('shelfData-fileInfoContainer').style.display = 'none';
-                    document.getElementById('shelfData-folderSelection').style.display = 'none';
-                    document.getElementById('shelfData-processBtn').disabled = true;
-                    document.getElementById('shelfData-uploadArea').style.display = 'block';
-                    document.getElementById('shelfData-status').style.display = 'none';
-                    document.getElementById('shelfData-progressContainer').style.display = 'none';
-                    shelfData_updateStepIndicator(1);
-                };
-
-                // データ処理関数をグローバルスコープに公開
-                window.shelfData_processFile = async function() {
-                    if (!shelfData_parsedData) return;
-
-                    const progressContainer = document.getElementById('shelfData-progressContainer');
-                    const progressBar = document.getElementById('shelfData-progressBar');
-
-                    shelfData_updateStepIndicator(3);
-                    processBtn.disabled = true;
-                    progressContainer.style.display = 'block';
-                    progressBar.style.width = '0%';
-
-                    try {
-                        shelfData_showStatusWithSpinner('processing', 'データを処理中...');
-
-                        const folderType = document.querySelector('input[name="shelfData-folderType"]:checked').value;
-                        const count = await shelfData_processData(shelfData_parsedData, folderType);
-
-                        shelfData_showStatus('success', `処理完了！ ${count}件のファイルを出力しました。`);
-                        progressBar.style.width = '100%';
-                    } catch (error) {
-                        shelfData_showStatus('error', `処理エラー: ${error.message}`);
-                        console.error(error);
-                    } finally {
-                        processBtn.disabled = false;
-                    }
-                };
-
-                // ステータス表示
-                function shelfData_showStatus(type, message) {
-                    const status = document.getElementById('shelfData-status');
-                    status.className = `status ${type}`;
-                    status.innerHTML = message;
-                    status.style.display = 'block';
-                }
-
-                function shelfData_showStatusWithSpinner(type, message) {
-                    const status = document.getElementById('shelfData-status');
-                    status.className = `status ${type}`;
-                    status.innerHTML = `<div class="loading-spinner"></div><span>${message}</span>`;
-                    status.style.display = 'flex';
-                }
-
-                function shelfData_updateStepIndicator(step) {
-                    document.querySelectorAll('#tabContent1 .step').forEach((el, idx) => {
-                        if (idx < step) {
-                            el.classList.add('active');
-                        } else {
-                            el.classList.remove('active');
-                        }
-                    });
-                }
-
-                function shelfData_updateProgress(percent) {
-                    const progressBar = document.getElementById('shelfData-progressBar');
-                    progressBar.style.width = `${percent}%`;
-                }
-
-                // データ処理メイン関数
-                async function shelfData_processData(data, folderType) {
-                    // ヘッダー行を取得
-                    const headers = data[0].map(h => String(h).trim());
-                    const rows = data.slice(1);
-
-                    // DataFrameのような構造に変換
-                    const df = rows.map(row => {
-                        const obj = {};
-                        headers.forEach((header, i) => {
-                            obj[header] = row[i];
-                        });
-                        return obj;
-                    }).filter(row => row['棚名称'] !== '設定なし' && row['棚名称']);
-
-                    if (df.length === 0) {
-                        throw new Error('有効なデータが見つかりません。');
-                    }
-
-                    // 店舗CD × 棚名称のユニークな組み合わせを取得
-                    const combinations = new Map();
-                    df.forEach(row => {
-                        const key = `${row['店舗CD']}_${row['棚名称']}`;
-                        if (!combinations.has(key)) {
-                            combinations.set(key, {
-                                店舗CD: row['店舗CD'],
-                                棚名称: row['棚名称']
-                            });
-                        }
-                    });
-
-                    const zip = new JSZip();
-                    let processedCount = 0;
-                    const totalCount = combinations.size;
-
-                    for (const [key, combo] of combinations) {
-                        // 進捗表示を更新
-                        shelfData_showStatusWithSpinner('processing', `処理中... (${processedCount + 1}/${totalCount}件)`);
-
-                        // 該当データを抽出
-                        let shelfData = df.filter(row =>
-                            row['店舗CD'] === combo.店舗CD && row['棚名称'] === combo.棚名称
-                        );
-
-                        // 棚番号でソート
-                        shelfData.sort((a, b) => {
-                            const numA = parseInt(a['棚番号']) || 0;
-                            const numB = parseInt(b['棚番号']) || 0;
-                            return numA - numB;
-                        });
-
-                        // 台番号の割り当て
-                        const shelfNumbers = [...new Set(shelfData.map(r => r['棚番号']))];
-                        const shelfToUnit = {};
-                        shelfNumbers.forEach((num, idx) => {
-                            shelfToUnit[num] = idx + 1;
-                        });
-
-                        shelfData.forEach(row => {
-                            row['台'] = shelfToUnit[row['棚番号']];
-                            row['列'] = Math.floor(parseInt(row['列']) / 10);
-                        });
-
-                        // 段の反転処理
-                        const unitGroups = {};
-                        shelfData.forEach(row => {
-                            const unit = row['台'];
-                            if (!unitGroups[unit]) unitGroups[unit] = [];
-                            unitGroups[unit].push(row);
-                        });
-
-                        Object.values(unitGroups).forEach(group => {
-                            const steps = group.map(r => parseInt(r['段']));
-                            const minStep = Math.min(...steps);
-                            const maxStep = Math.max(...steps);
-
-                            group.forEach(row => {
-                                const currentStep = parseInt(row['段']);
-                                row['段'] = maxStep - (currentStep - minStep);
-                            });
-                        });
-
-                        // メタ情報の取得
-                        const storeName = shelfData[0]['店舗'];
-                        const shelfName = shelfData[0]['棚名称'];
-                        const patternName = shelfData[0]['棚パターン名'];
-
-                        // フォルダ名とファイル名の決定
-                        let folderName, fileName;
-                        if (folderType === 'store') {
-                            folderName = shelfData_sanitizeFilename(`${combo.店舗CD}-${storeName}`);
-                            fileName = shelfData_sanitizeFilename(`${storeName}_${shelfName}_${patternName}.csv`);
-                        } else {
-                            folderName = shelfData_sanitizeFilename(shelfName);
-                            fileName = shelfData_sanitizeFilename(`${shelfName}_${patternName}.csv`);
-                        }
-
-                        // 台幅の判定
-                        const shelfWidth = ['3尺', 'ｻｲﾄﾞﾈｯﾄ', 'ｼｰｽﾞﾆﾝｸﾞ'].some(x => patternName.includes(x)) ? 900 : 1200;
-
-                        // CSV出力データの構築
-                        const outputData = [];
-                        outputData.push(['共通棚割情報', 'V3.0', 'IC']);
-                        outputData.push([fileName]);
-                        outputData.push(['台番号', '台高さ', '台幅', '台奥行', '台名称']);
-
-                        const uniqueUnits = [...new Set(shelfData.map(r => r['台']))].sort((a, b) => a - b);
-                        uniqueUnits.forEach(unit => {
-                            outputData.push([unit, 2400, shelfWidth, 400, '']);
-                        });
-
-                        outputData.push(['台番号', '棚段番号', '棚高さ', '棚幅', '棚奥行', '棚厚さ', '棚種別']);
-
-                        uniqueUnits.forEach(unit => {
-                            const unitData = shelfData.filter(r => r['台'] === unit);
-                            const maxStep = Math.max(...unitData.map(r => parseInt(r['段'])));
-                            const shelfHeights = shelfData_calculateShelfHeights(maxStep);
-
-                            const uniqueSteps = [...new Set(unitData.map(r => parseInt(r['段'])))].sort((a, b) => a - b);
-                            uniqueSteps.forEach((step, idx) => {
-                                outputData.push([unit, step, shelfHeights[idx], shelfWidth, 400, 10, 1]);
-                            });
-                        });
-
-                        outputData.push(['台番号', '棚段番号', '棚位置', '商品コード', 'フェース数', 'フェース面', 'フェース回転', '積上陳列数', '在庫数量', 'フェース内陳列区分', 'フェース内位置', '奥行陳列数']);
-
-                        shelfData.sort((a, b) => {
-                            if (a['台'] !== b['台']) return a['台'] - b['台'];
-                            return parseInt(a['段']) - parseInt(b['段']);
-                        });
-
-                        shelfData.forEach(row => {
-                            outputData.push([
-                                row['台'],
-                                row['段'],
-                                row['列'],
-                                row['JAN'],
-                                row['フェイス数'],
-                                1, 0, 1, 0, 0, 1, 1
-                            ]);
-                        });
-
-                        // CSVに変換
-                        const csvContent = outputData.map(row => row.join(',')).join('\r\n');
-
-                        // Shift_JISにエンコード
-                        const unicodeArray = [];
-                        for (let i = 0; i < csvContent.length; i++) {
-                            unicodeArray.push(csvContent.charCodeAt(i));
-                        }
-                        const sjisArray = Encoding.convert(unicodeArray, {
-                            to: 'SJIS',
-                            from: 'UNICODE'
-                        });
-                        const uint8Array = new Uint8Array(sjisArray);
-
-                        // ZIPに追加
-                        zip.folder(folderName).file(fileName, uint8Array);
-
-                        processedCount++;
-                        shelfData_updateProgress((processedCount / totalCount) * 100);
-                    }
-
-                    // 出力ファイル一覧を作成
-                    shelfData_showStatusWithSpinner('processing', '出力ファイル一覧を作成中...');
-                    const fileList = [];
-                    zip.forEach((relativePath, file) => {
-                        if (!file.dir) {
-                            fileList.push([relativePath]);
-                        }
-                    });
-
-                    const listCsv = 'ファイルパス\r\n' + fileList.map(row => row.join(',')).join('\r\n');
-
-                    // 一覧CSVもShift_JISにエンコード
-                    const listUnicodeArray = [];
-                    for (let i = 0; i < listCsv.length; i++) {
-                        listUnicodeArray.push(listCsv.charCodeAt(i));
-                    }
-                    const listSjisArray = Encoding.convert(listUnicodeArray, {
-                        to: 'SJIS',
-                        from: 'UNICODE'
-                    });
-                    const listUint8Array = new Uint8Array(listSjisArray);
-
-                    zip.file('出力ファイル一覧.csv', listUint8Array);
-
-                    // ZIPをダウンロード
-                    shelfData_showStatusWithSpinner('processing', 'ZIPファイルを生成中...');
-                    const content = await zip.generateAsync({
-                        type: 'blob',
-                        compression: "DEFLATE",
-                        compressionOptions: {
-                            level: 9
-                        }
-                    });
-                    shelfData_showStatus('success', 'ZIPファイルをダウンロード中...');
-                    saveAs(content, `棚割データ_${folderType === 'store' ? '店舗別' : '棚名称別'}_${new Date().toISOString().slice(0, 10)}.zip`);
-
-                    return totalCount;
-                }
-
-                function shelfData_calculateShelfHeights(maxStep) {
-                    const baseHeight = 150;
-                    const totalHeight = 2400;
-                    const availableHeight = totalHeight - baseHeight;
-
-                    if (maxStep < 2 || maxStep > 9) {
-                        return [];
-                    }
-
-                    const interval = Math.floor(availableHeight / (maxStep - 1));
-                    const heights = [];
-                    for (let i = 0; i < maxStep; i++) {
-                        heights.push(baseHeight + i * interval);
-                    }
-                    return heights;
-                }
-
-                function shelfData_sanitizeFilename(filename) {
-                    return filename.replace(/[\\/:*?"<>|]/g, '');
-                }
-
                 console.log('棚割データ処理ツール初期化完了');
-            })();
-        }
+            };
+
+        })();
 
         function initProfitAnalysisTool() {
             // 収益分析ツールの初期化
             console.log('収益分析ツール初期化');
         }
 
-        function initSalesTreeTool() {
-            // IIFE内でスコープ分離
-            (function() {
-                // ツール専用のグローバル変数
-                let salesTree_excelData = null;
-                const salesTree_hierarchyLevels = ['ディビジョン', 'ライン', '部門', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント'];
+        // ========================================
+        // Sales Tree Tool - Standalone IIFE
+        // ========================================
+        (function() {
+            'use strict';
 
-                // ファイル読み込み
-                readExcelFile('salesTree').then(data => {
-                    if (data) {
-                        salesTree_excelData = data;
-                        console.log('読み込んだデータ:', salesTree_excelData.length, '行');
-                        salesTree_populateFilters();
-                        document.getElementById('salesTree-controls').classList.add('active');
-                    }
-                }).catch(error => {
-                    console.error('ファイル読み込みエラー:', error);
-                    salesTree_showError('ファイルの読み込みに失敗しました: ' + error.message);
-                });
+            // ツール専用のグローバル変数
+            let salesTree_excelData = null;
+            const salesTree_hierarchyLevels = ['ディビジョン', 'ライン', '部門', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント'];
+            let initialized = false;
 
-                function salesTree_populateFilters() {
+            // Helper function definitions
+            function salesTree_populateFilters() {
                     // 分析基準
                     const analysisBaseSet = new Set();
                     salesTree_excelData.forEach(row => {
@@ -5413,51 +5414,71 @@
                     errorDiv.style.display = 'block';
                 }
 
-                console.log('売上分解ツリー初期化完了');
-            })();
-        }
+            // Expose the init function
+            window.initSalesTreeTool = function() {
+                if (initialized) return;
+                initialized = true;
 
-        function initSalesBreakdownTool() {
-            // IIFE内でスコープ分離
-            (function() {
-                // ツール専用のグローバル変数
-                let salesBreakdown_rawData = [];
-                let salesBreakdown_filteredData = [];
-                let salesBreakdown_hierarchy = [];
-                let salesBreakdown_sortState = { column: null, direction: 'asc' };
-
-                const salesBreakdown_hierarchyLevels = [
-                    'ディビジョン',
-                    'ライン',
-                    '部門',
-                    'カテゴリー',
-                    'サブカテゴリー',
-                    'セグメント',
-                    'サブセグメント'
-                ];
-
-                // ファイルアップロード処理
-                const uploadArea = document.getElementById('salesBreakdown-uploadArea');
-
-                uploadArea.addEventListener('click', async () => {
-                    try {
-                        if (!fileHandles['salesBreakdown']) {
-                            alert('先にフォルダ選択タブでフォルダを選択してください。');
-                            return;
-                        }
-
-                        const workbook = await readExcelFile('salesBreakdown');
-                        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-                        salesBreakdown_rawData = XLSX.utils.sheet_to_json(sheet);
-
-                        document.getElementById('salesBreakdown-mainContent').classList.remove('hidden');
-                        document.getElementById('salesBreakdown-uploadArea').style.display = 'none';
-                        salesBreakdown_initializeFilters();
-                        salesBreakdown_updateTable();
-                    } catch (error) {
-                        alert('ファイルの読み込みに失敗しました: ' + error.message);
+                // ファイル読み込み
+                readExcelFile('salesTree').then(data => {
+                    if (data) {
+                        salesTree_excelData = data;
+                        console.log('読み込んだデータ:', salesTree_excelData.length, '行');
+                        salesTree_populateFilters();
+                        document.getElementById('salesTree-controls').classList.add('active');
                     }
+                }).catch(error => {
+                    console.error('ファイル読み込みエラー:', error);
+                    salesTree_showError('ファイルの読み込みに失敗しました: ' + error.message);
                 });
+
+                console.log('売上分解ツリー初期化完了');
+            };
+        })();
+
+        // ========================================
+        // Sales Breakdown Tool - Standalone IIFE
+        // ========================================
+        (function() {
+            'use strict';
+
+            // ツール専用のグローバル変数
+            let salesBreakdown_rawData = [];
+            let salesBreakdown_filteredData = [];
+            let salesBreakdown_hierarchy = [];
+            let salesBreakdown_sortState = { column: null, direction: 'asc' };
+            let initialized = false;
+
+            const salesBreakdown_hierarchyLevels = [
+                'ディビジョン',
+                'ライン',
+                '部門',
+                'カテゴリー',
+                'サブカテゴリー',
+                'セグメント',
+                'サブセグメント'
+            ];
+
+            // Helper function definitions
+            async function salesBreakdown_handleUpload() {
+                try {
+                    if (!fileHandles['salesBreakdown']) {
+                        alert('先にフォルダ選択タブでフォルダを選択してください。');
+                        return;
+                    }
+
+                    const workbook = await readExcelFile('salesBreakdown');
+                    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                    salesBreakdown_rawData = XLSX.utils.sheet_to_json(sheet);
+
+                    document.getElementById('salesBreakdown-mainContent').classList.remove('hidden');
+                    document.getElementById('salesBreakdown-uploadArea').style.display = 'none';
+                    salesBreakdown_initializeFilters();
+                    salesBreakdown_updateTable();
+                } catch (error) {
+                    alert('ファイルの読み込みに失敗しました: ' + error.message);
+                }
+            }
 
                 function salesBreakdown_initializeFilters() {
                     // タイプ分類の取得
@@ -5840,57 +5861,70 @@
                     });
                 }
 
+            // Expose the init function
+            window.initSalesBreakdownTool = function() {
+                if (initialized) return;
+                initialized = true;
+
+                // Add event listener for upload area
+                const uploadArea = document.getElementById('salesBreakdown-uploadArea');
+                uploadArea.addEventListener('click', salesBreakdown_handleUpload);
+
                 console.log('売上分解表ツール初期化完了');
-            })();
-        }
+            };
+        })();
 
-        function initCustomerAnalysisTool() {
-            // IIFE内でスコープ分離
-            (function() {
-                // ツール専用のグローバル変数
-                let customerAnalysis_rawData = [];
-                let customerAnalysis_currentHierarchy = [];
-                let customerAnalysis_sortState = {column: null, direction: null};
-                let customerAnalysis_columnOrder = ['年代', 'ライフステージ', '来店距離'];
-                let customerAnalysis_visibleColumns = {
-                    '年代': true,
-                    'ライフステージ': true,
-                    '来店距離': true
-                };
+        // ========================================
+        // Customer Analysis Tool - Standalone IIFE
+        // ========================================
+        (function() {
+            'use strict';
 
-                // 階層スライサーの選択状態
-                let customerAnalysis_slicerSelections = {
-                    'ディビジョン': [],
-                    'ライン': [],
-                    '部門': [],
-                    'カテゴリー': [],
-                    'サブカテゴリー': [],
-                    'セグメント': [],
-                    'サブセグメント': []
-                };
+            // ツール専用のグローバル変数
+            let customerAnalysis_rawData = [];
+            let customerAnalysis_currentHierarchy = [];
+            let customerAnalysis_sortState = {column: null, direction: null};
+            let customerAnalysis_columnOrder = ['年代', 'ライフステージ', '来店距離'];
+            let customerAnalysis_visibleColumns = {
+                '年代': true,
+                'ライフステージ': true,
+                '来店距離': true
+            };
+            let customerAnalysis_draggedElement = null;
+            let customerAnalysis_draggedColumn = null;
+            let initialized = false;
 
-                const customerAnalysis_hierarchyLevels = ['ディビジョン', 'ライン', '部門', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント'];
+            // 階層スライサーの選択状態
+            let customerAnalysis_slicerSelections = {
+                'ディビジョン': [],
+                'ライン': [],
+                '部門': [],
+                'カテゴリー': [],
+                'サブカテゴリー': [],
+                'セグメント': [],
+                'サブセグメント': []
+            };
 
-                const uploadArea = document.getElementById('customerAnalysis-uploadArea');
+            const customerAnalysis_hierarchyLevels = ['ディビジョン', 'ライン', '部門', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント'];
 
-                // アップロードエリアのクリック処理
-                uploadArea.addEventListener('click', async () => {
-                    try {
-                        if (!fileHandles['customerAnalysis']) {
-                            alert('先にフォルダ選択タブでフォルダを選択してください。');
-                            return;
-                        }
-
-                        const workbook = await readExcelFile('customerAnalysis');
-                        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                        const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-
-                        customerAnalysis_rawData = jsonData;
-                        customerAnalysis_initializeData();
-                    } catch (error) {
-                        alert('ファイルの読み込みに失敗しました: ' + error.message);
+            // Helper function definitions
+            async function customerAnalysis_handleUpload() {
+                try {
+                    if (!fileHandles['customerAnalysis']) {
+                        alert('先にフォルダ選択タブでフォルダを選択してください。');
+                        return;
                     }
-                });
+
+                    const workbook = await readExcelFile('customerAnalysis');
+                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                    const jsonData = XLSX.utils.sheet_to_json(firstSheet);
+
+                    customerAnalysis_rawData = jsonData;
+                    customerAnalysis_initializeData();
+                } catch (error) {
+                    alert('ファイルの読み込みに失敗しました: ' + error.message);
+                }
+            }
 
                 function customerAnalysis_initializeData() {
                     document.getElementById('customerAnalysis-mainContent').classList.remove('hidden');
@@ -6373,10 +6407,7 @@
                     });
                 }
 
-                let customerAnalysis_draggedElement = null;
-                let customerAnalysis_draggedColumn = null;
-
-                function customerAnalysis_setupDragAndDrop() {
+            function customerAnalysis_setupDragAndDrop() {
                     const draggableHeaders = document.querySelectorAll('#customerAnalysis-tableContainer .draggable-header');
 
                     draggableHeaders.forEach(header => {
@@ -6434,14 +6465,24 @@
                     return false;
                 }
 
-                function customerAnalysis_handleDragEnd(e) {
-                    document.querySelectorAll('#customerAnalysis-tableContainer .draggable-header').forEach(header => {
-                        header.classList.remove('dragging', 'drag-over');
-                    });
-                    customerAnalysis_draggedElement = null;
-                    customerAnalysis_draggedColumn = null;
-                }
+            function customerAnalysis_handleDragEnd(e) {
+                document.querySelectorAll('#customerAnalysis-tableContainer .draggable-header').forEach(header => {
+                    header.classList.remove('dragging', 'drag-over');
+                });
+                customerAnalysis_draggedElement = null;
+                customerAnalysis_draggedColumn = null;
+            }
 
+            // Expose the init function
+            window.initCustomerAnalysisTool = function() {
+                if (initialized) return;
+                initialized = true;
+
+                // Add event listener for upload area
+                const uploadArea = document.getElementById('customerAnalysis-uploadArea');
+                uploadArea.addEventListener('click', customerAnalysis_handleUpload);
+
+                // Add event listener for drill all button
                 document.getElementById('customerAnalysis-drillAllBtn').addEventListener('click', () => {
                     if (customerAnalysis_currentHierarchy.length < 6) {
                         customerAnalysis_currentHierarchy.push('*ALL*');
@@ -6450,6 +6491,7 @@
                     }
                 });
 
+                // Add event listener for export button
                 document.getElementById('customerAnalysis-exportTableBtn').addEventListener('click', () => {
                     const table = document.querySelector('#customerAnalysis-tableContainer table');
                     if (!table) {
@@ -6491,87 +6533,75 @@
                 });
 
                 console.log('顧客属性詳細分析ツール初期化完了');
-            })();
-        }
+            };
+        })();
 
         // initVisualBenchmarkTool is defined in the Visual Benchmarking Tool IIFE
 
-        function initABCAnalysisTool() {
-            // IIFE内でスコープ分離
-            (function() {
-                // ツール専用のグローバル変数
-                let abcAnalysis_rawData = [];
-                let abcAnalysis_filteredData = [];
-                let abcAnalysis_displayData = [];
-                let abcAnalysis_analysisResults = [];
-                let abcAnalysis_currentSortColumn = null;
-                let abcAnalysis_currentSortOrder = null;
-                let abcAnalysis_columnOrder = [];
-                let abcAnalysis_availableColumns = [];
+        // ========================================
+        // ABC Analysis Tool - Standalone IIFE
+        // ========================================
+        (function() {
+            'use strict';
 
-                const abcAnalysis_defaultColumns = [
-                    'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント',
-                    'JAN', '商品名', '規格',
-                    '●売上金額(円)', '売上金額ABC', '●売上金額/1店', '売上金額/1店ABC',
-                    '導入時推定売上金額/1店', '推定売上金額/1店ABC', '●リピート率', 'リピート率ABC'
-                ];
+            // ツール専用のグローバル変数
+            let abcAnalysis_rawData = [];
+            let abcAnalysis_filteredData = [];
+            let abcAnalysis_displayData = [];
+            let abcAnalysis_analysisResults = [];
+            let abcAnalysis_currentSortColumn = null;
+            let abcAnalysis_currentSortOrder = null;
+            let abcAnalysis_columnOrder = [];
+            let abcAnalysis_availableColumns = [];
+            let initialized = false;
 
-                const abcAnalysis_allColumnsOrder = [
-                    'ディビジョン', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント',
-                    'JAN', '商品名', '規格', 'メーカー名', 'ブランド',
-                    '発単', '幅', '高さ', '奥行', '季節', 'マスタ登録', '定番', '推定値算出可否',
-                    'MEGA店舗数', 'SuC店舗数', '●SMART(L/S)店舗数', 'SMART(boxなど)店舗数',
-                    '平均単価', '市場平均単価', '●売上数量', '●売上数量/1店',
-                    '●売上金額(円)', '売上金額ABC', '●売上金額/1店', '売上金額/1店ABC',
-                    '●PI値', 'PI値(参考)', '市場PI値', 'POS客数全体', 'POS客数全体/1店',
-                    '導入時推定売上数量/1店', '導入時推定売上金額/1店', '推定売上金額/1店ABC',
-                    '●1回あたり点数', '●バスケット出現率', '●リピート率', 'リピート率ABC',
-                    '最大顧客年代層', '最大ライフステージ層',
-                    '【東海】数量PI値順位', '【東海】数量PI値相対指数', '【東海】エリア特化指数(RPI)'
-                ];
+            const abcAnalysis_defaultColumns = [
+                'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント',
+                'JAN', '商品名', '規格',
+                '●売上金額(円)', '売上金額ABC', '●売上金額/1店', '売上金額/1店ABC',
+                '導入時推定売上金額/1店', '推定売上金額/1店ABC', '●リピート率', 'リピート率ABC'
+            ];
 
-                // アップロードエリアのクリック処理
-                const uploadArea = document.getElementById('abc-uploadArea');
-                uploadArea.addEventListener('click', async () => {
-                    try {
-                        if (!fileHandles['abcAnalysis']) {
-                            alert('先にフォルダ選択タブでフォルダを選択してください。');
-                            return;
-                        }
+            const abcAnalysis_allColumnsOrder = [
+                'ディビジョン', 'カテゴリー', 'サブカテゴリー', 'セグメント', 'サブセグメント',
+                'JAN', '商品名', '規格', 'メーカー名', 'ブランド',
+                '発単', '幅', '高さ', '奥行', '季節', 'マスタ登録', '定番', '推定値算出可否',
+                'MEGA店舗数', 'SuC店舗数', '●SMART(L/S)店舗数', 'SMART(boxなど)店舗数',
+                '平均単価', '市場平均単価', '●売上数量', '●売上数量/1店',
+                '●売上金額(円)', '売上金額ABC', '●売上金額/1店', '売上金額/1店ABC',
+                '●PI値', 'PI値(参考)', '市場PI値', 'POS客数全体', 'POS客数全体/1店',
+                '導入時推定売上数量/1店', '導入時推定売上金額/1店', '推定売上金額/1店ABC',
+                '●1回あたり点数', '●バスケット出現率', '●リピート率', 'リピート率ABC',
+                '最大顧客年代層', '最大ライフステージ層',
+                '【東海】数量PI値順位', '【東海】数量PI値相対指数', '【東海】エリア特化指数(RPI)'
+            ];
 
-                        const workbook = await readExcelFile('abcAnalysis');
-                        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                        const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-
-                        abcAnalysis_rawData = jsonData;
-
-                        if (abcAnalysis_rawData.length > 0) {
-                            abcAnalysis_availableColumns = Object.keys(abcAnalysis_rawData[0]);
-                        }
-
-                        abcAnalysis_initializeFilters();
-                        abcAnalysis_initializeColumnSelector();
-                        document.getElementById('abc-analysisSection').classList.remove('hidden');
-                        document.getElementById('abc-uploadArea').style.display = 'none';
-                    } catch (error) {
-                        alert('ファイルの読み込みに失敗しました: ' + error.message);
+            // Helper function definitions
+            async function abcAnalysis_handleUpload() {
+                try {
+                    if (!fileHandles['abcAnalysis']) {
+                        alert('先にフォルダ選択タブでフォルダを選択してください。');
+                        return;
                     }
-                });
 
-                document.getElementById('abc-executeBtn').addEventListener('click', abcAnalysis_executeAnalysis);
-                document.getElementById('abc-exportExcelBtn').addEventListener('click', abcAnalysis_exportToExcel);
-                document.getElementById('abc-fixHeaderCheck').addEventListener('change', abcAnalysis_toggleHeaderFixed);
+                    const workbook = await readExcelFile('abcAnalysis');
+                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                    const jsonData = XLSX.utils.sheet_to_json(firstSheet);
 
-                ['abc-postFilterCategory', 'abc-postFilterSubCategory', 'abc-postFilterSegment',
-                 'abc-postFilterSubSegment', 'abc-postFilterMaker', 'abc-postFilterBrand',
-                 'abc-postFilterTeiban', 'abc-postFilterSuitei'].forEach(id => {
-                    document.getElementById(id).addEventListener('change', abcAnalysis_applyPostFilters);
-                });
+                    abcAnalysis_rawData = jsonData;
 
-                document.getElementById('abc-filterDivision').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('division'));
-                document.getElementById('abc-filterCategory').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('category'));
-                document.getElementById('abc-filterSubCategory').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('subCategory'));
-                document.getElementById('abc-filterSegment').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('segment'));
+                    if (abcAnalysis_rawData.length > 0) {
+                        abcAnalysis_availableColumns = Object.keys(abcAnalysis_rawData[0]);
+                    }
+
+                    abcAnalysis_initializeFilters();
+                    abcAnalysis_initializeColumnSelector();
+                    document.getElementById('abc-analysisSection').classList.remove('hidden');
+                    document.getElementById('abc-uploadArea').style.display = 'none';
+                } catch (error) {
+                    alert('ファイルの読み込みに失敗しました: ' + error.message);
+                }
+            }
 
                 function abcAnalysis_initializeFilters() {
                     abcAnalysis_populateFilter('abc-filterDivision', 'ディビジョン', abcAnalysis_rawData);
@@ -7081,9 +7111,36 @@
                     XLSX.writeFile(wb, `ABC分析結果_${ts}.xlsx`);
                 }
 
+            // Expose the init function
+            window.initABCAnalysisTool = function() {
+                if (initialized) return;
+                initialized = true;
+
+                // Add event listener for upload area
+                const uploadArea = document.getElementById('abc-uploadArea');
+                uploadArea.addEventListener('click', abcAnalysis_handleUpload);
+
+                // Add event listeners for buttons
+                document.getElementById('abc-executeBtn').addEventListener('click', abcAnalysis_executeAnalysis);
+                document.getElementById('abc-exportExcelBtn').addEventListener('click', abcAnalysis_exportToExcel);
+                document.getElementById('abc-fixHeaderCheck').addEventListener('change', abcAnalysis_toggleHeaderFixed);
+
+                // Add event listeners for post filters
+                ['abc-postFilterCategory', 'abc-postFilterSubCategory', 'abc-postFilterSegment',
+                 'abc-postFilterSubSegment', 'abc-postFilterMaker', 'abc-postFilterBrand',
+                 'abc-postFilterTeiban', 'abc-postFilterSuitei'].forEach(id => {
+                    document.getElementById(id).addEventListener('change', abcAnalysis_applyPostFilters);
+                });
+
+                // Add event listeners for hierarchy filters
+                document.getElementById('abc-filterDivision').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('division'));
+                document.getElementById('abc-filterCategory').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('category'));
+                document.getElementById('abc-filterSubCategory').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('subCategory'));
+                document.getElementById('abc-filterSegment').addEventListener('change', () => abcAnalysis_updateHierarchyFilters('segment'));
+
                 console.log('ABC分析ツール初期化完了');
-            })();
-        }
+            };
+        })();
 
         // ========================================
         // 収益分析ツール (tabContent2) JavaScript
